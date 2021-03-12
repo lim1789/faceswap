@@ -6,7 +6,7 @@ import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from lib.gui import (TaskBar, CliOptions, CommandNotebook, ConsoleOut, Session, DisplayNotebook,
+from lib.gui import (TaskBar, CliOptions, CommandNotebook, ConsoleOut, DisplayNotebook,
                      get_images, initialize_images, initialize_config, LastSession,
                      MainMenuBar, preview_trigger, ProcessWrapper, StatusBar)
 
@@ -40,8 +40,7 @@ class FaceswapGui(tk.Tk):
         """ Initialize config and images global constants """
         cliopts = CliOptions()
         statusbar = StatusBar(self)
-        session = Session()
-        config = initialize_config(self, cliopts, statusbar, session)
+        config = initialize_config(self, cliopts, statusbar)
         initialize_images()
         return config
 
@@ -52,11 +51,18 @@ class FaceswapGui(tk.Tk):
             tk.font.nametofont(font).configure(family=self._config.default_font[0],
                                                size=self._config.default_font[1])
 
-    @staticmethod
-    def set_styles():
+    def set_styles(self):
         """ Set global custom styles """
         gui_style = ttk.Style()
         gui_style.configure('TLabelframe.Label', foreground="#0046D5", relief=tk.SOLID)
+        gui_style.configure('H1.TLabel',
+                            font=(self._config.default_font[0],
+                                  self._config.default_font[1] + 4,
+                                  "bold"))
+        gui_style.configure('H2.TLabel',
+                            font=(self._config.default_font[0],
+                                  self._config.default_font[1] + 2,
+                                  "bold"))
 
     def build_gui(self, rebuild=False):
         """ Build the GUI """
@@ -87,20 +93,14 @@ class FaceswapGui(tk.Tk):
         """ Add the paned window containers that
             hold each main area of the gui """
         logger.debug("Adding containers")
-        maincontainer = tk.PanedWindow(self,
-                                       sashrelief=tk.RIDGE,
-                                       sashwidth=4,
-                                       sashpad=8,
-                                       orient=tk.VERTICAL,
-                                       name="pw_main")
+        maincontainer = ttk.PanedWindow(self,
+                                        orient=tk.VERTICAL,
+                                        name="pw_main")
         maincontainer.pack(fill=tk.BOTH, expand=True)
 
-        topcontainer = tk.PanedWindow(maincontainer,
-                                      sashrelief=tk.RIDGE,
-                                      sashwidth=4,
-                                      sashpad=8,
-                                      orient=tk.HORIZONTAL,
-                                      name="pw_top")
+        topcontainer = ttk.PanedWindow(maincontainer,
+                                       orient=tk.HORIZONTAL,
+                                       name="pw_top")
         maincontainer.add(topcontainer)
 
         bottomcontainer = ttk.Frame(maincontainer, name="frame_bottom")
@@ -131,8 +131,8 @@ class FaceswapGui(tk.Tk):
         logger.debug("Setting Initial Layout: (root_width: %s, root_height: %s, width_ratio: %s, "
                      "height_ratio: %s, width: %s, height: %s", r_width, r_height, w_ratio,
                      h_ratio, width, height)
-        self.objects["container_top"].sash_place(0, width, 1)
-        self.objects["container_main"].sash_place(0, 1, height)
+        self.objects["container_top"].sashpos(0, width)
+        self.objects["container_main"].sashpos(0, height)
         self.update_idletasks()
 
     def rebuild(self):

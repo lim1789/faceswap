@@ -12,16 +12,19 @@ import logging
 import os
 import time
 
+from concurrent import futures
+from functools import partial
+
 import cv2
 import numpy as np
 
 import tensorflow as tf
-from tensorflow.python import errors_impl as tf_errors  # pylint:disable=no-name-in-module
+from tensorflow.python.framework import errors_impl as tf_errors
 from tqdm import tqdm
 
-from lib.alignments import Alignments
-from lib.faces_detect import DetectedFace
-from lib.image import read_image_hash_batch
+from lib.align import (Alignments, AlignedFace, DetectedFace, get_centered_size,
+                       update_legacy_png_header)
+from lib.image import read_image_meta_batch
 from lib.training_data import TrainingDataGenerator
 from lib.utils import FaceswapError, get_backend, get_folder, get_image_paths
 from plugins.train._config import Config
@@ -71,18 +74,19 @@ class TrainerBase():
     def __init__(self, model, images, batch_size, configfile):
         logger.debug("Initializing %s: (model: '%s', batch_size: %s)",
                      self.__class__.__name__, model, batch_size)
-        self._config = _get_config(".".join(self.__module__.split(".")[-2:]),
-                                   configfile=configfile)
         self._model = model
+        self._config = self._get_config(configfile)
+
         self._model.state.add_session_batchsize(batch_size)
         self._images = images
         self._sides = sorted(key for key in self._images.keys())
+        alignment_data = self._get_alignments_data()
 
         self._feeder = _Feeder(images,
                                self._model,
                                batch_size,
                                self._config,
-                               self._get_alignments_data())
+                               alignment_data)
 
         self._tensorboard = self._set_tensorboard()
         self._samples = _Samples(self._model,
@@ -91,34 +95,77 @@ class TrainerBase():
         self._timelapse = _Timelapse(self._model,
                                      self._model.coverage_ratio,
                                      self._config.get("preview_images", 14),
-                                     self._feeder)
+                                     self._feeder,
+                                     self._images)
         logger.debug("Initialized %s", self.__class__.__name__)
+
+    def _get_config(self, configfile):
+        """ Get the saved training config options. Override any global settings with the setting
+        provided from the model's saved config.
+
+        Parameters
+        -----------
+        configfile: str
+            The path to a custom configuration file. If ``None`` is passed then configuration is
+            loaded from the default :file:`.config.train.ini` file.
+
+        Returns
+        -------
+        dict
+            The trainer configuration options
+        """
+        config = _get_config(".".join(self.__module__.split(".")[-2:]),
+                             configfile=configfile)
+        for key, val in config.items():
+            if key in self._model.config and val != self._model.config[key]:
+                new_val = self._model.config[key]
+                logger.debug("Updating global training config item for '%s' form '%s' to '%s'",
+                             key, val, new_val)
+                config[key] = new_val
+        return config
 
     def _get_alignments_data(self):
         """ Extrapolate alignments and masks from the alignments file into a `dict` for the
         training data generator.
 
+        Removes any images from :attr:`_images` if they do not have alignment data attached.
+
         Returns
         -------
         dict:
-            Includes the key `landmarks` if landmarks are required for training and the key `masks`
-            if the masks are required for training. """
-        retval = dict()
-
-        get_masks = self._model.config["learn_mask"] or self._model.config["penalized_mask_loss"]
-        if not self._model.command_line_arguments.warp_to_landmarks and not get_masks:
-            return retval
+            Includes the key `aligned_faces` holding aligned face information and the key
+            `versions` indicating the alignments file versions that the faces have come from.
+            In addition, the following optional keys are provided: `masks` if masks are required
+            for training, `masks_eye` if eye masks are required and `masks_mouth` if mouth masks
+            are required. """
+        penalized_loss = self._model.config["penalized_mask_loss"]
 
         alignments = _TrainingAlignments(self._model, self._images)
+        # Update centering if it has been changed by legacy face sets in TrainingAlignments
+        self._config["centering"] = self._model.config["centering"]
+        retval = dict(aligned_faces=alignments.aligned_faces,
+                      versions=alignments.versions)
 
-        if self._model.command_line_arguments.warp_to_landmarks:
-            logger.debug("Adding landmarks to training opts dict")
-            retval["landmarks"] = alignments.landmarks
-
-        if get_masks:
+        if self._model.config["learn_mask"] or penalized_loss:
             logger.debug("Adding masks to training opts dict")
             retval["masks"] = alignments.masks
-        logger.debug(retval)
+
+        if penalized_loss and self._model.config["eye_multiplier"] > 1:
+            retval["masks_eye"] = alignments.masks_eye
+
+        if penalized_loss and self._model.config["mouth_multiplier"] > 1:
+            retval["masks_mouth"] = alignments.masks_mouth
+
+        logger.debug({key: {k: v if isinstance(v, float) else len(v)
+                            for k, v in val.items()}
+                      for key, val in retval.items()})
+
+        # Replace _images with list containing valid alignment data
+        for side, aligned_faces in alignments.aligned_faces.items():
+            if len(aligned_faces) != len(self._images[side]):
+                logger.info("Updating training images list with images containing valid metadata "
+                            "for side '%s'", side.upper())
+                self._images[side] = list(aligned_faces.keys())
         return retval
 
     def _set_tensorboard(self):
@@ -320,8 +367,8 @@ class _Feeder():
     config: :class:`lib.config.FaceswapConfig`
         The configuration for this trainer
     alignments: dict
-        A dictionary containing landmarks and masks if these are required for training for each
-        side
+        A dictionary containing aligned face data, extract version information and masks if these
+        are required for training for each side
     """
     def __init__(self, images, model, batch_size, config, alignments):
         logger.debug("Initializing %s: num_images: %s, batch_size: %s, config: %s)",
@@ -360,8 +407,10 @@ class _Feeder():
         generator = TrainingDataGenerator(input_size,
                                           output_shapes,
                                           self._model.coverage_ratio,
+                                          self._model.color_order,
                                           not self._model.command_line_arguments.no_augment_color,
                                           self._model.command_line_arguments.no_flip,
+                                          self._model.command_line_arguments.no_warp,
                                           self._model.command_line_arguments.warp_to_landmarks,
                                           self._alignments,
                                           self._config)
@@ -407,11 +456,13 @@ class _Feeder():
         model_inputs = []
         model_targets = []
         for side in ("a", "b"):
-            side_inputs, side_targets = self._get_next(side)
-            if self._model.config["penalized_mask_loss"]:
-                side_targets = self._compile_masks(side_targets)
-                if not self._model.config["learn_mask"]:  # Remove masks from the model targets
-                    side_targets = side_targets[:-1]
+            batch = next(self._feeds[side])
+            side_inputs = batch["feed"]
+            side_targets = self._compile_mask_targets(batch["targets"],
+                                                      batch["masks"],
+                                                      batch.get("additional_masks", None))
+            if self._model.config["learn_mask"]:
+                side_targets = side_targets + [batch["masks"]]
             logger.trace("side: %s, input_shapes: %s, target_shapes: %s",
                          side, [i.shape for i in side_inputs], [i.shape for i in side_targets])
             if get_backend() == "amd":
@@ -422,35 +473,21 @@ class _Feeder():
                 model_targets.append(side_targets)
         return model_inputs, model_targets
 
-    def _get_next(self, side):
-        """ Return the next batch from the :class:`lib.training_data.TrainingDataGenerator` for
-        this feeder ready for feeding into the model.
-
-        Returns
-        -------
-        model_inputs: list
-            A list of :class:`numpy.ndarray` for feeding into the model
-        model_targets: list
-            A list of :class:`numpy.ndarray` for comparing the output of the model
-        """
-        logger.trace("Generating targets")
-        batch = next(self._feeds[side])
-        targets_use_mask = (self._model.config["learn_mask"]
-                            or self._model.config["penalized_mask_loss"])
-        model_targets = batch["targets"] + batch["masks"] if targets_use_mask else batch["targets"]
-        return batch["feed"], model_targets
-
-    @classmethod
-    def _compile_masks(cls, targets):
-        """ Compile the masks into the targets for penalized loss.
+    def _compile_mask_targets(self, targets, masks, additional_masks):
+        """ Compile the masks into the targets for penalized loss and for targeted learning.
 
         Penalized loss expects the target mask to be included for all outputs in the 4th channel
-        of the targets. The final output and final mask are always the last 2 outputs
+        of the targets. Any additional masks are placed into subsequent channels for extraction
+        by the relevant loss functions.
 
         Parameters
         ----------
         targets: list
             The targets for the model, with the mask as the final entry in the list
+        masks: list
+            The masks for the model
+        additional_masks: list or ``None``
+            Any additional masks for the model, or ``None`` if no additional masks are required
 
         Returns
         -------
@@ -458,15 +495,26 @@ class _Feeder():
             The targets for the model with the mask compiled into the 4th channel. The original
             mask is still output as the final item in the list
         """
-        masks = targets[-1]
-        for idx, tgt in enumerate(targets[:-1]):
+        if not self._model.config["penalized_mask_loss"] and additional_masks is None:
+            logger.trace("No masks to compile. Returning targets")
+            return targets
+
+        if not self._model.config["penalized_mask_loss"] and additional_masks is not None:
+            masks = additional_masks
+        elif additional_masks is not None:
+            masks = np.concatenate((masks, additional_masks), axis=-1)
+
+        for idx, tgt in enumerate(targets):
             tgt_dim = tgt.shape[1]
             if tgt_dim == masks.shape[1]:
                 add_masks = masks
             else:
                 add_masks = np.array([cv2.resize(mask, (tgt_dim, tgt_dim))
-                                      for mask in masks])[..., None]
+                                      for mask in masks])
+                if add_masks.ndim == 3:
+                    add_masks = add_masks[..., None]
             targets[idx] = np.concatenate((tgt, add_masks), axis=-1)
+        logger.trace("masks added to targets: %s", [tgt.shape for tgt in targets])
         return targets
 
     def generate_preview(self, do_preview):
@@ -488,7 +536,7 @@ class _Feeder():
             batch = next(self._display_feeds["preview"][side])
             self._samples[side] = batch["samples"]
             self._target[side] = batch["targets"][-1]
-            self._masks[side] = batch["masks"][0]
+            self._masks[side] = batch["masks"]
 
     def compile_sample(self, batch_size, samples=None, images=None, masks=None):
         """ Compile the preview samples for display.
@@ -547,7 +595,7 @@ class _Feeder():
             batchsizes.append(len(batch["samples"]))
             samples[side] = batch["samples"]
             images[side] = batch["targets"][-1]
-            masks[side] = batch["masks"][0]
+            masks[side] = batch["masks"]
         batchsize = min(batchsizes)
         sample = self.compile_sample(batchsize, samples=samples, images=images, masks=masks)
         return sample
@@ -728,7 +776,7 @@ class _Samples():  # pylint:disable=too-few-public-methods
         return preds
 
     def _to_full_frame(self, side, samples, predictions):
-        """ Patch targets and prediction images into images of training image size.
+        """ Patch targets and prediction images into images of model output size.
 
         Parameters
         ----------
@@ -747,58 +795,64 @@ class _Samples():  # pylint:disable=too-few-public-methods
         logger.debug("side: '%s', number of sample arrays: %s, prediction.shapes: %s)",
                      side, len(samples), [pred.shape for pred in predictions])
         full, faces = samples[:2]
-        images = [faces] + predictions
-        full_size = full.shape[1]
-        target_size = int(full_size * self._coverage_ratio)
-        if target_size != full_size:
-            frame = self._frame_overlay(full, target_size, (0, 0, 255))
 
+        if self._model.color_order.lower() == "rgb":  # Switch color order for RGB model display
+            full = full[..., ::-1]
+            faces = faces[..., ::-1]
+            predictions = [pred[..., ::-1] if pred.shape[-1] == 3 else pred
+                           for pred in predictions]
+
+        full = self._process_full(side, full, predictions[0].shape[1], (0, 0, 255))
+        images = [faces] + predictions
         if self._display_mask:
             images = self._compile_masked(images, samples[-1])
-        images = [self._resize_sample(side, image, target_size) for image in images]
-        if target_size != full_size:
-            images = [self._overlay_foreground(frame, image) for image in images]
+        images = [self._overlay_foreground(full.copy(), image) for image in images]
+
         if self._scaling != 1.0:
-            new_size = int(full_size * self._scaling)
+            new_size = int(images[0].shape[1] * self._scaling)
             images = [self._resize_sample(side, image, new_size) for image in images]
         return images
 
-    @classmethod
-    def _frame_overlay(cls, images, target_size, color):
+    def _process_full(self, side, images, prediction_size, color):
         """ Add a frame overlay to preview images indicating the region of interest.
 
-        This is the red border that appears in the preview images.
+        This applies the red border that appears in the preview images.
 
         Parameters
         ----------
+        side: {"a" or "b"}
+            The side that these samples are for
         images: :class:`numpy.ndarray`
-            The samples to apply the frame to
-        target_size: int
-            The size of the sample within the full size frame
+            The input training images to to process
+        prediction_size: int
+            The size of the predicted output from the model
         color: tuple
             The (Blue, Green, Red) color to use for the frame
 
         Returns
         -------
         :class:`numpy,ndarray`
-            The samples with the frame overlay applied
+            The input training images, sized for output and annotated for coverage
         """
-        logger.debug("full_size: %s, target_size: %s, color: %s",
-                     images.shape[1], target_size, color)
-        new_images = list()
-        full_size = images.shape[1]
-        padding = (full_size - target_size) // 2
-        length = target_size // 4
-        t_l, b_r = (padding, full_size - padding)
+        logger.debug("full_size: %s, prediction_size: %s, color: %s",
+                     images.shape[1], prediction_size, color)
+
+        display_size = int((prediction_size / self._coverage_ratio // 2) * 2)
+        images = self._resize_sample(side, images, display_size)  # Resize targets to display size
+        padding = (display_size - prediction_size) // 2
+        if padding == 0:
+            logger.debug("Resized background. Shape: %s", images.shape)
+            return images
+
+        length = display_size // 4
+        t_l, b_r = (padding - 1, display_size - padding)
         for img in images:
-            cv2.rectangle(img, (t_l, t_l), (t_l + length, t_l + length), color, 3)
-            cv2.rectangle(img, (b_r, t_l), (b_r - length, t_l + length), color, 3)
-            cv2.rectangle(img, (b_r, b_r), (b_r - length, b_r - length), color, 3)
-            cv2.rectangle(img, (t_l, b_r), (t_l + length, b_r - length), color, 3)
-            new_images.append(img)
-        retval = np.array(new_images)
-        logger.debug("Overlayed background. Shape: %s", retval.shape)
-        return retval
+            cv2.rectangle(img, (t_l, t_l), (t_l + length, t_l + length), color, 1)
+            cv2.rectangle(img, (b_r, t_l), (b_r - length, t_l + length), color, 1)
+            cv2.rectangle(img, (b_r, b_r), (b_r - length, b_r - length), color, 1)
+            cv2.rectangle(img, (t_l, b_r), (t_l + length, b_r - length), color, 1)
+        logger.debug("Overlayed background. Shape: %s", images.shape)
+        return images
 
     @classmethod
     def _compile_masked(cls, faces, masks):
@@ -854,16 +908,14 @@ class _Samples():  # pylint:disable=too-few-public-methods
             The preview images compiled into the full frame size for each preview
         """
         offset = (backgrounds.shape[1] - foregrounds.shape[1]) // 2
-        new_images = list()
-        for idx, img in enumerate(backgrounds):
-            img[offset:offset + foregrounds[idx].shape[0],
-                offset:offset + foregrounds[idx].shape[1], :3] = foregrounds[idx]
-            new_images.append(img)
-        retval = np.array(new_images)
-        logger.debug("Overlayed foreground. Shape: %s", retval.shape)
-        return retval
+        for foreground, background in zip(foregrounds, backgrounds):
+            background[offset:offset + foreground.shape[0],
+                       offset:offset + foreground.shape[1], :3] = foreground
+        logger.debug("Overlayed foreground. Shape: %s", backgrounds.shape)
+        return backgrounds
 
-    def _get_headers(self, side, width):
+    @classmethod
+    def _get_headers(cls, side, width):
         """ Set header row for the final preview frame
 
         Parameters
@@ -882,14 +934,15 @@ class _Samples():  # pylint:disable=too-few-public-methods
                      side, width)
         titles = ("Original", "Swap") if side == "a" else ("Swap", "Original")
         side = side.upper()
-        height = int(64 * self._scaling)
+        height = int(width / 4.5)
         total_width = width * 3
         logger.debug("height: %s, total_width: %s", height, total_width)
         font = cv2.FONT_HERSHEY_SIMPLEX
         texts = ["{} ({})".format(titles[0], side),
                  "{0} > {0}".format(titles[0]),
                  "{} > {}".format(titles[0], titles[1])]
-        text_sizes = [cv2.getTextSize(texts[idx], font, self._scaling * 0.8, 1)[0]
+        scaling = (width / 144) * 0.45
+        text_sizes = [cv2.getTextSize(texts[idx], font, scaling, 1)[0]
                       for idx in range(len(texts))]
         text_y = int((height + text_sizes[0][1]) / 2)
         text_x = [int((width - text_sizes[idx][0]) / 2) + width * idx
@@ -902,7 +955,7 @@ class _Samples():  # pylint:disable=too-few-public-methods
                         text,
                         (text_x[idx], text_y),
                         font,
-                        self._scaling * 0.8,
+                        scaling,
                         (0, 0, 0),
                         1,
                         lineType=cv2.LINE_AA)
@@ -947,15 +1000,18 @@ class _Timelapse():  # pylint:disable=too-few-public-methods
         The number of preview images to be displayed in the time-lapse
     feeder: dict
         The :class:`_Feeder` for generating the time-lapse images.
+    image_paths: dict
+        The full paths to the training images for each side of the model
     """
-    def __init__(self, model, coverage_ratio, image_count, feeder):
+    def __init__(self, model, coverage_ratio, image_count, feeder, image_paths):
         logger.debug("Initializing %s: model: %s, coverage_ratio: %s, image_count: %s, "
-                     "feeder: '%s')", self.__class__.__name__, model, coverage_ratio,
-                     image_count, feeder)
+                     "feeder: '%s', image_paths: %s)", self.__class__.__name__, model,
+                     coverage_ratio, image_count, feeder, len(image_paths))
         self._num_images = image_count
         self._samples = _Samples(model, coverage_ratio)
         self._model = model
         self._feeder = feeder
+        self._image_paths = image_paths
         self._output_file = None
         logger.debug("Initialized %s", self.__class__.__name__)
 
@@ -979,7 +1035,13 @@ class _Timelapse():  # pylint:disable=too-few-public-methods
         self._output_file = str(output)
         logger.debug("Time-lapse output set to '%s'", self._output_file)
 
-        images = {"a": get_image_paths(input_a), "b": get_image_paths(input_b)}
+        # Rewrite paths to pull from the training images so mask and face data can be accessed
+        images = dict()
+        for side, input_ in zip(("a", "b"), (input_a, input_b)):
+            training_path = os.path.dirname(self._image_paths[side][0])
+            images[side] = [os.path.join(training_path, os.path.basename(pth))
+                            for pth in get_image_paths(input_)]
+
         batchsize = min(len(images["a"]),
                         len(images["b"]),
                         self._num_images)
@@ -1030,114 +1092,36 @@ class _TrainingAlignments():
                      self.__class__.__name__, model, {k: len(v) for k, v in image_list.items()})
         self._args = model.command_line_arguments
         self._config = model.config
-        self._training_size = model.state.training_size
-        self._alignments_paths = self._get_alignments_paths()
-        self._hashes = self._get_image_hashes(image_list)
-        self._detected_faces = self._load_alignments()
-        self._check_all_faces()
+
+        self._alignments_version = dict()
+        self._image_sizes = {key: None for key in image_list}
+        self._detected_faces = self._load_detected_faces(image_list)
+        self._update_legacy_facesets(image_list)
+
+        self._validity_check()
+        self._aligned_faces = self._get_aligned_faces()
         logger.debug("Initialized %s", self.__class__.__name__)
 
-    # Get landmarks
     @property
-    def landmarks(self):
-        """ dict: The :class:`numpy.ndarray` aligned landmarks for keys "a" and "b" """
-        retval = {side: self._transform_landmarks(side, detected_faces)
-                  for side, detected_faces in self._detected_faces.items()}
-        logger.trace(retval)
-        return retval
+    def versions(self):
+        """ dict: The "a", "b" keys for each side, with value being the alignment file version
+        that provided the data. This is used to crop the faces correctly based on whether the
+        extracted faces are legacy or full-head extracts. """
+        return self._alignments_version
 
-    def _get_alignments_paths(self):
-        """ Obtain the alignments file paths from the command line arguments passed to the model.
-
-        If the argument does not exist or is empty, then scan the input folder for an alignments
-        file.
-
-        Returns
-        -------
-        dict
-            The alignments paths for each of the source and destination faces. Key is the
-            side, value is the path to the alignments file
-
-        Raises
-        ------
-        FaceswapError
-            If at least one alignments file does not exist
-        """
-        retval = dict()
-        for side in ("a", "b"):
-            alignments_path = getattr(self._args, "alignments_path_{}".format(side))
-            if not alignments_path:
-                image_path = getattr(self._args, "input_{}".format(side))
-                alignments_path = os.path.join(image_path, "alignments.fsa")
-            if not os.path.exists(alignments_path):
-                raise FaceswapError("Alignments file does not exist: `{}`".format(alignments_path))
-            retval[side] = alignments_path
-        logger.debug("Alignments paths: %s", retval)
-        return retval
-
-    def _transform_landmarks(self, side, detected_faces):
-        """ Transform frame landmarks to their aligned face variant.
-
-        Parameters
-        ----------
-        side: {"a" or "b"}
-            The side currently being processed
-        detected_faces: list
-            A list of :class:`lib.faces_detect.DetectedFace` objects
-
-        Returns
-        -------
-        dict
-            The face filenames as keys with the aligned landmarks as value.
-        """
-        landmarks = dict()
-        for face in detected_faces.values():
-            face.load_aligned(None, size=self._training_size)
-            for filename in self._hash_to_filenames(side, face.hash):
-                landmarks[filename] = face.aligned_landmarks
-        return landmarks
-
-    # Get masks
     @property
-    def masks(self):
-        """ dict: The :class:`lib.faces_detect.Mask` objects of requested mask type for
-        keys a" and "b"
-        """
-        retval = {side: self._get_masks(side, detected_faces)
-                  for side, detected_faces in self._detected_faces.items()}
-        logger.trace(retval)
-        return retval
+    def aligned_faces(self):
+        """ dict: The "a", "b" keys for each side, containing a sub-dictionary with the
+        filename as key and :class:`lib.align.AlignedFace` object as value. """
+        return self._aligned_faces
 
-    def _get_masks(self, side, detected_faces):
-        """ For each face, obtain the mask and set the requested blurring and threshold level.
+    # <<< LOAD DETECTED FACE INFORMATION FROM PNG HEADER >>>
+    def _load_detected_faces(self, image_list):
+        """ Obtain the metadata from the png training image headers for all images used for
+        training.
 
-        Parameters
-        ----------
-        side: {"a" or "b"}
-            The side currently being processed
-        detected_faces: dict
-            Key is the hash of the face, value is the corresponding
-            :class:`lib.faces_detect.DetectedFace` object
-
-        Returns
-        -------
-        dict
-            The face filenames as keys with the :class:`lib.faces_detect.Mask` as value.
-        """
-
-        masks = dict()
-        for fhash, face in detected_faces.items():
-            mask = face.mask[self._config["mask_type"]]
-            mask.set_blur_and_threshold(blur_kernel=self._config["mask_blur_kernel"],
-                                        threshold=self._config["mask_threshold"])
-            for filename in self._hash_to_filenames(side, fhash):
-                masks[filename] = mask
-        return masks
-
-    # Hashes for image folders
-    @classmethod
-    def _get_image_hashes(cls, image_list):
-        """ Return the hashes for all images used for training.
+        The Faceswap alignments data is returned as a dictionary, whist :attr:`_image_sizes` is
+        populated from the training image metadata
 
         Parameters
         ----------
@@ -1149,189 +1133,347 @@ class _TrainingAlignments():
         Returns
         -------
         dict
-            For keys "a" and "b" the values are a ``dict`` with the key being the sha1 hash and
-            the value being a list of filenames that correspond to the hash for images that exist
-            within the training data folder
+            For keys "a" and "b" the values are a ``dict`` with the key being the filename of the
+            training image and the value being the :class:`lib.align.DetectedFace` object
         """
-        hashes = {key: dict() for key in image_list}
+        metadata = dict()
         for side, filelist in image_list.items():
+            meta_side = dict()
             logger.debug("side: %s, file count: %s", side, len(filelist))
-            for filename, hsh in tqdm(read_image_hash_batch(filelist),
-                                      desc="Reading training images ({})".format(side.upper()),
-                                      total=len(filelist),
-                                      leave=False):
-                hashes[side].setdefault(hsh, list()).append(filename)
-        logger.trace(hashes)
-        return hashes
+            for filename, meta in tqdm(read_image_meta_batch(filelist),
+                                       desc="Reading training images ({})".format(side.upper()),
+                                       total=len(filelist),
+                                       leave=False):
 
-    # Hashes for Detected Faces
-    def _load_alignments(self):
-        """ Load the alignments and convert to :class:`lib.faces_detect.DetectedFace` objects.
+                self._validate_image_size(side, filename, meta["width"], meta["height"])
 
-        Returns
-        -------
-        dict
-            For keys "a" and "b" values are a dict with the key being the sha1 hash of the face
-            and the value being the corresponding :class:`lib.faces_detect.DetectedFace` object.
-        """
-        logger.debug("Loading alignments")
-        retval = dict()
-        for side, fullpath in self._alignments_paths.items():
-            logger.debug("side: '%s', path: '%s'", side, fullpath)
-            path, filename = os.path.split(fullpath)
-            alignments = Alignments(path, filename=filename)
-            retval[side] = self._to_detected_faces(alignments, side)
-        logger.debug("Returning: %s", {k: len(v) for k, v in retval.items()})
-        return retval
+                if "itxt" not in meta or "alignments" not in meta["itxt"]:
+                    meta_side[filename] = None
+                else:
+                    alignments_version = meta["itxt"]["source"]["alignments_version"]
+                    self._alignments_version.setdefault(side, set()).add(alignments_version)
+                    detected_face = DetectedFace()
+                    detected_face.from_png_meta(meta["itxt"]["alignments"])
+                    meta_side[filename] = detected_face
+            metadata[side] = meta_side
+        return metadata
 
-    def _to_detected_faces(self, alignments, side):
-        """ Convert alignments to DetectedFace objects.
-
-        Filter the detected faces to only those that exist in the training folders.
+    def _validate_image_size(self, side, filename, width, height):
+        """ Validate that the images are square and that the sizes for all image in a side are
+        the same.
 
         Parameters
         ----------
-        alignments: :class:`lib.alignments.Alignments`
-            The alignments for the current faces
-        side: {"a" or "b"}
-            The side being processed
-
-        Returns
-        -------
-        dict
-            key is sha1 hash of face, value is the corresponding
-            :class:`lib.faces_detect.DetectedFace` object
-        """
-        skip_count = 0
-        dupe_count = 0
-        side_hashes = set(self._hashes[side])
-        detected_faces = dict()
-        for _, faces, _, filename in alignments.yield_faces():
-            for idx, face in enumerate(faces):
-                if face["hash"] in detected_faces:
-                    dupe_count += 1
-                    logger.debug("Face already exists, skipping: '%s'", filename)
-                if not self._validate_face(face, filename, idx, side, side_hashes):
-                    skip_count += 1
-                    continue
-                detected_face = DetectedFace()
-                detected_face.from_alignment(face)
-                detected_faces[face["hash"]] = detected_face
-        logger.debug("Detected Faces count: %s, Skipped faces count: %s, duplicate faces "
-                     "count: %s", len(detected_faces), skip_count, dupe_count)
-        if skip_count != 0:
-            logger.warning("%s alignments have been removed as their corresponding faces do not "
-                           "exist in the input folder for side %s. Run in verbose mode if you "
-                           "wish to see which alignments have been excluded.",
-                           skip_count, side.upper())
-        return detected_faces
-
-    # Validation
-    def _validate_face(self, face, filename, idx, side, side_hashes):
-        """ Validate that the currently processing face has a corresponding hash entry and the
-        requested mask exists
-
-        Parameters
-        ----------
-        face: dict
-            A face retrieved from an alignments file
+        side: ["a" or "b"]
+            The training side that is being processed
         filename: str
-            The original frame filename that the given face comes from
-        idx: int
-            The index of the face in the frame
-        side: {'A', 'B'}
-            The side that this face belongs to
-        side_hashes: set
-            A set of hashes that exist in the alignments folder for these faces
+            The filename of the image that is being validated
+        width: int
+            The width of the image to be validated
+        height: int
+            The height of the image to be validated
+
+        Raises
+        ------
+        FaceswapError
+            If the image to be checked is not square or is of a different size of any other image
+            for the current side, an error is raised.
+        """
+        # Add the image size to the sizes dictionary if this is the first image
+        if not self._image_sizes[side]:
+            self._image_sizes[side] = width
+
+        # Validate image is square
+        if width != height:
+            msg = ("Training images must be created by the extraction process and must be "
+                   "square.\nThe image '{}' has dimensions {}x{} so the process cannot "
+                   "continue.\nThere may be more images with these issues. Please double "
+                   "check your dataset".format(filename, width, height))
+            raise FaceswapError(msg)
+
+        # Validate image is the same size as the other images for the side
+        if width != self._image_sizes[side]:
+            msg = ("All training images for each side must be of the same size.\nImages "
+                   "in side '{}' have mismatched sizes {} and {}.\nPlease double check "
+                   "your dataset".format(side.upper(), self._image_sizes[side], width))
+            raise FaceswapError(msg)
+
+    def _update_legacy_facesets(self, image_list):
+        """ Update the png header data for legacy face sets that do not contain the meta data in
+        the exif header.
+
+        Parameters
+        ----------
+        image_list: dict
+            The file paths for the images to be trained on for each side. The dictionary should
+            contain 2 keys ("a" and "b") with the values being a list of full paths corresponding
+            to each side.
+        """
+        if self._validate_metadata(output_warning=False):
+            logger.debug("All faces contain valid header information")
+            return
+
+        for side, png_meta in self._detected_faces.items():
+            if all(png_meta.values()):
+                continue
+            filenames = [filename for filename, meta in png_meta.items() if not meta]
+            logger.info("Legacy faces discovered for side '%s'. Updating %s images...",
+                        side.upper(), len(filenames))
+            alignments = Alignments(*os.path.split(self._get_alignments_path(side)))
+            self._alignments_version.setdefault(side, set()).add(alignments.version)
+
+            executor = futures.ThreadPoolExecutor()
+            with executor:
+                images = {executor.submit(update_legacy_png_header, filename, alignments): filename
+                          for filename in filenames}
+
+                for future in tqdm(
+                        futures.as_completed(images),
+                        desc="Updating legacy training images ({})".format(side.upper()),
+                        total=len(filenames),
+                        leave=False):
+                    result = future.result()
+                    if result:
+                        filename = images[future]
+                        if os.path.splitext(filename)[-1].lower() != ".png":
+                            # Update the image list to point at newly created png
+                            del png_meta[filename]
+                            image_list[side].remove(filename)
+
+                            filename = os.path.splitext(filename)[0] + ".png"
+                            image_list[side].append(filename)
+
+                        detected_face = DetectedFace()
+                        detected_face.from_png_meta(future.result()["alignments"])
+                        png_meta[filename] = detected_face
+
+    def _get_alignments_path(self, side):
+        """ Obtain the path to an alignments file for the given training side.
+
+        Used for updating legacy face sets to contain the meta information within the image header
+
+        Parameters
+        ----------
+        side: ["a" or "b"]
+            The training side to obtain the alignments file for.
+
+        Returns
+        -------
+        str
+            The full path to the training alignments file
+
+        Raises
+        ------
+        FaceswapError
+            If an alignments file cannot be located
+        """
+        alignments_path = getattr(self._args, "alignments_path_{}".format(side))
+        if not alignments_path:
+            image_path = getattr(self._args, "input_{}".format(side))
+            alignments_path = os.path.join(image_path, "alignments.fsa")
+        if not os.path.exists(alignments_path):
+            msg = ("You are using a legacy faceset that does not contain embedded "
+                   "meta-information. An alignments file must be provided so that these files can "
+                   "be updated.\n"
+                   f"Alignments file does not exist: '{alignments_path}'")
+            raise FaceswapError(msg)
+        return alignments_path
+
+    # <<< VALIDATE LOADED DETECTED FACE INFORMATION >>>
+    def _validity_check(self):
+        """ Check the validity of the finally loaded data.
+
+        Ensure that each side contains alignments data that was extracted with the same centering.
+        Ensure that each side has a full compliment of metadata.
+        """
+        invalid = [side.upper()
+                   for side, vers in self._alignments_version.items()
+                   if len(vers) > 1 and any(v < 2 for v in vers) and any(v > 1 for v in vers)]
+
+        if invalid:
+            raise FaceswapError("Mixing legacy and full head extracted facesets is not supported. "
+                                "The following side(s) contain a mix of extracted face "
+                                "types: {}".format(invalid))
+        # Replace check alignments version sets with actual floats
+        self._alignments_version = {key: val.pop()
+                                    for key, val in self._alignments_version.items()}
+
+        if 1.0 in self._alignments_version.values() and self._config["centering"] != "legacy":
+            logger.warning("You are using legacy extracted faces but have selected '%s' "
+                           "centering which is incompatible. Switching centering to 'legacy'",
+                           self._config["centering"])
+            self._config["centering"] = "legacy"
+
+        self._validate_metadata(output_warning=True)
+        self._validate_masks()
+
+    def _validate_metadata(self, output_warning=True):
+        """ Validate that all images to be trained on have associated alignments data. If not
+        generate a warning.
+
+        Parameters
+        ----------
+        output_warning: bool, optional
+            If ``True`` outputs a warning that images are missing alignments data.
 
         Returns
         -------
         bool
-            ``True`` if the face is valid otherwise ``False``
+            ``True`` if all images have valid metadata otherwise ``False``
+        """
+        all_valid = {side: all(val.values()) for side, val in self._detected_faces.items()}
+        if all(all_valid.values()):
+            return True
+        if not output_warning:
+            return False
+
+        for side, valid in all_valid.items():
+            if valid:
+                continue
+            if all(val is None for val in self._detected_faces[side].values()):
+                raise FaceswapError("There is no valid training data for side '{}'. Re-check your "
+                                    "data and try again.".format(side.upper()))
+            invalid = [filename
+                       for filename, meta in self._detected_faces[side].items() if not meta]
+
+            logger.warning("Data for training side '%s' contains %s faces that do not contain "
+                           "valid metadata and will be excluded from training.",
+                           side.upper(), len(invalid))
+            logger.warning("Run in VERBOSE mode if you wish to see a list of these files.")
+            logger.verbose("Side '%s' images missing metadata: %s", side.upper(),
+                           sorted(os.path.basename(fname) for fname in invalid))
+            # Remove images without metadata
+            self._detected_faces[side] = {key: val
+                                          for key, val in self._detected_faces[side].items()
+                                          if val}
+        return False
+
+    def _validate_masks(self):
+        """ Validate the the loaded metadata all contain the masks required for training.
 
         Raises
         ------
         FaceswapError
-            If the current face doesn't pass validation
+            If at least one face in the training data does not contain the selected mask type
         """
         mask_type = self._config["mask_type"]
-        if mask_type is not None and "mask" not in face:
-            msg = ("You have selected a Mask Type in your training configuration options but at "
-                   "least one face has no mask stored for it.\nYou should generate the required "
-                   "masks with the Mask Tool or set the Mask Type configuration option to `none`."
-                   "\nThe face that caused this failure was side: `{}`, frame: `{}`, index: {}. "
-                   "However there are probably more faces without masks".format(
-                       side.upper(), filename, idx))
+        if mask_type is None:
+            logger.debug("No mask selected. Not validating")
+            return
+        invalid = {side: [filename for filename, detected_face in faces.items()
+                          if mask_type not in detected_face.mask]
+                   for side, faces in self._detected_faces.items()}
+        if any(invalid.values()):
+            msg = ("You have selected the Mask Type '{}' in your training configuration options "
+                   "but at least one face does not have this mask type stored for it.\nYou should "
+                   "select a mask type that exists within your face data, or generate the "
+                   "required masks with the Mask Tool.".format(mask_type))
+            for side, filenames in invalid.items():
+                if not filenames:
+                    continue
+                available = set(mask
+                                for det_face in self._detected_faces[side].values()
+                                for mask in det_face.mask)
+                msg += ("\n{} faces in side {} do not contain the mask '{}'. Available "
+                        "masks: {}".format(len(filenames), side.upper(), mask_type, available))
             raise FaceswapError(msg)
 
-        if mask_type is not None and mask_type not in face["mask"]:
-            msg = ("At least one of your faces does not have the mask `{}` stored for it.\nYou "
-                   "should run the Mask Tool to generate this mask for your faceset or "
-                   "select a different mask in the training configuration options.\n"
-                   "The face that caused this failure was [side: `{}`, frame: `{}`, index: {}]. "
-                   "The masks that exist for this face are: {}.\nBe aware that there are probably "
-                   "more faces without this Mask Type".format(
-                       mask_type, side.upper(), filename, idx, list(face["mask"].keys())))
-            raise FaceswapError(msg)
+    # <<< LOAD REQUIRED DATA FOR TRAINING >>>
+    def _get_aligned_faces(self):
+        """ Pre-generate aligned faces as they are needed for all training functions.
 
-        if face["hash"] not in side_hashes:
-            logger.verbose("Skipping alignment for non-existant face in frame '%s' index: %s",
-                           filename, idx)
-            return False
-        return True
-
-    def _check_all_faces(self):
-        """ Ensure that all faces in the training folder exist in the alignments file.
-        If not, output missing filenames
-
-        Raises
-        ------
-        FaceswapError
-            If there are faces in the training folder which do not exist in the alignments file
+        Returns
+        -------
+        dict
+            The "a", "b" keys for each side, containing a sub-dictionary with the
+            filename as key and :class:`lib.align.AlignedFace` object as value.
         """
-        logger.debug("Checking faces exist in alignments")
-        missing_alignments = dict()
-        for side, train_hashes in self._hashes.items():
-            align_hashes = set(self._detected_faces[side])
-            if not align_hashes.issuperset(set(train_hashes)):
-                missing_alignments[side] = [
-                    os.path.basename(filename)
-                    for hsh, filenames in train_hashes.items()
-                    for filename in filenames
-                    if hsh not in align_hashes]
-        if missing_alignments:
-            msg = ("There are faces in your training folder(s) which do not exist in your "
-                   "alignments file. Training cannot continue. See above for a full list of "
-                   "files missing alignments.")
-            for side, filelist in missing_alignments.items():
-                logger.error("Faces missing alignments for side %s: %s",
-                             side.capitalize(), filelist)
-            raise FaceswapError(msg)
+        logger.debug("Loading aligned faces: %s",
+                     {k: len(v) for k, v in self._detected_faces.items()})
+        retval = dict()
+        for side, detected_faces in self._detected_faces.items():
+            retval[side] = dict()
+            size = get_centered_size("legacy" if self._alignments_version[side] == 1.0 else "head",
+                                     self._config["centering"],
+                                     self._image_sizes[side])
+            for filename, face in detected_faces.items():
+                retval[side][filename] = AlignedFace(face.landmarks_xy,
+                                                     centering=self._config["centering"],
+                                                     size=size,
+                                                     is_aligned=True)
+        logger.debug("Loaded aligned faces: %s", {k: len(v) for k, v in retval.items()})
+        return retval
 
-    # Utils
-    def _hash_to_filenames(self, side, face_hash):
-        """ For a given hash return all the filenames that match for the given side.
+    # Get masks
+    @property
+    def masks(self):
+        """ dict: The :class:`lib.align.Mask` objects of requested mask type for
+        keys a" and "b"
+        """
+        retval = dict()
+        for side, faces in self._detected_faces.items():
+            retval[side] = dict()
+            for filename, detected_face in faces.items():
+                mask = detected_face.mask[self._config["mask_type"]]
+                mask.set_blur_and_threshold(blur_kernel=self._config["mask_blur_kernel"],
+                                            threshold=self._config["mask_threshold"])
+                if self._alignments_version[side] > 1.0 and self._config["centering"] == "legacy":
+                    mask.set_sub_crop(self._aligned_faces[side][filename].pose.offset["face"] * -1)
+                retval[side][filename] = mask
+        logger.trace(retval)
+        return retval
 
-        Notes
-        -----
-        Multiple faces can have the same hash, so this makes sure that all filenames are updated
-        for all instances of a hash.
+    @property
+    def masks_eye(self):
+        """ dict: filename mapping to zip compressed eye masks for keys "a" and "b" """
+        retval = {side: self._get_landmarks_masks(side, detected_faces, "eyes")
+                  for side, detected_faces in self._detected_faces.items()}
+        return retval
+
+    @property
+    def masks_mouth(self):
+        """ dict: filename mapping to zip compressed mouth masks for keys "a" and "b" """
+        retval = {side: self._get_landmarks_masks(side, detected_faces, "mouth")
+                  for side, detected_faces in self._detected_faces.items()}
+        return retval
+
+    def _get_landmarks_masks(self, side, detected_faces, area):
+        """ Obtain the area landmarks masks for the given area.
+
+        A :func:`functools.partial` is returned rather than the full compressed mask to speed up
+        pre-loading. The partials are expanded the first time they are accessed within the training
+        loop.
 
         Parameters
         ----------
         side: {"a" or "b"}
             The side currently being processed
-        face_hash: str
-            The sha1 hash of the face to obtain the filename for
+        detected_faces: dict
+            Key is the filename of the face, value is the corresponding
+            :class:`lib.align.DetectedFace` object
+        area: {"eyes" or "mouth"}
+            The area of the face to obtain the mask for
 
         Returns
         -------
-        list
-            The filenames that exist for the given hash
+        dict
+            The face filenames as keys with the :func:`functools.partial` of the mask as value
         """
-        retval = self._hashes[side][face_hash]
-        logger.trace("side: %s, hash: %s, filenames: %s", side, face_hash, retval)
-        return retval
+        logger.trace("side: %s, detected_faces: %s, area: %s", side, detected_faces, area)
+        masks = dict()
+        size = list(self._aligned_faces[side].values())[0].size
+        for filename, face in detected_faces.items():
+            masks[filename] = partial(face.get_landmark_mask,
+                                      size,
+                                      area,
+                                      aligned=True,
+                                      centering=self._config["centering"],
+                                      dilation=size // 32,
+                                      blur_kernel=size // 16,
+                                      as_zip=True)
+        logger.trace("side: %s, area: %s, masks: %s",
+                     side, area, {key: type(val) for key, val in masks.items()})
+        return masks
 
 
 def _stack_images(images):

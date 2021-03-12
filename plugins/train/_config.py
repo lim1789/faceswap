@@ -3,12 +3,8 @@
 
 import logging
 import os
-import sys
-
-from importlib import import_module
 
 from lib.config import FaceswapConfig
-from lib.utils import full_path_split
 from plugins.plugin_loader import PluginLoader
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -25,16 +21,7 @@ class Config(FaceswapConfig):
         logger.debug("Setting defaults")
         self._set_globals()
         self._set_loss()
-        current_dir = os.path.dirname(__file__)
-        for dirpath, _, filenames in os.walk(current_dir):
-            default_files = [fname for fname in filenames if fname.endswith("_defaults.py")]
-            if not default_files:
-                continue
-            base_path = os.path.dirname(os.path.realpath(sys.argv[0]))
-            import_path = ".".join(full_path_split(dirpath.replace(base_path, ""))[1:])
-            plugin_type = import_path.split(".")[-1]
-            for filename in default_files:
-                self.load_module(filename, import_path, plugin_type)
+        self._defaults_from_plugin(os.path.dirname(__file__))
 
     def _set_globals(self):
         """ Set the global options for training """
@@ -42,6 +29,24 @@ class Config(FaceswapConfig):
         section = "global"
         self.add_section(title=section,
                          info="Options that apply to all models" + ADDITIONAL_INFO)
+        self.add_item(
+            section=section,
+            title="centering",
+            datatype=str,
+            gui_radio=True,
+            default="face",
+            choices=["face", "legacy"],
+            fixed=True,
+            group="face",
+            info="How to center the training image. The extracted images are centered on the "
+                 "middle of the skull based on the face's estimated pose. A subsection of these "
+                 "images are used for training. The centering used dictates how this subsection "
+                 "will be cropped from the aligned images."
+                 "\n\tface: Centers the training image on the center of the face, adjusting for "
+                 "pitch and yaw."
+                 "\n\tlegacy: The 'original' extraction technique. Centers the training image "
+                 "near the tip of the nose with no adjustment. Can result in the edges of the "
+                 "face appearing outside of the training area.")
         self.add_item(
             section=section,
             title="coverage",
@@ -54,8 +59,9 @@ class Config(FaceswapConfig):
             info="How much of the extracted image to train on. A lower coverage will limit the "
                  "model's scope to a zoomed-in central area while higher amounts can include the "
                  "entire face. A trade-off exists between lower amounts given more detail "
-                 "versus higher amounts avoiding noticeable swap transitions. Sensible values to "
-                 "use are:"
+                 "versus higher amounts avoiding noticeable swap transitions. For 'Face' "
+                 "centering you will want to leave this above 75%. Sensible values for 'Legacy' "
+                 "centering are:"
                  "\n\t62.5%% spans from eyebrow to eyebrow."
                  "\n\t75.0%% spans from temple to temple."
                  "\n\t87.5%% spans from ear to ear."
@@ -148,7 +154,7 @@ class Config(FaceswapConfig):
             datatype=bool,
             default=False,
             group="network",
-            info="R|[Nvidia Only], NVIDIA GPUs can run operations in float16 faster than in "
+            info="[Nvidia Only], NVIDIA GPUs can run operations in float16 faster than in "
                  "float32. Mixed precision allows you to use a mix of float16 with float32, to "
                  "get the performance benefits from float16 and the numeric stability benefits "
                  "from float32.\n\nWhile mixed precision will run on most Nvidia models, it will "
@@ -266,6 +272,36 @@ class Config(FaceswapConfig):
                  "\n\t 0 - Disables L2 Regularization altogether.")
         self.add_item(
             section=section,
+            title="eye_multiplier",
+            datatype=int,
+            group="loss",
+            min_max=(1, 40),
+            rounding=1,
+            default=3,
+            fixed=False,
+            info="The amount of priority to give to the eyes.\n\nThe value given here is as a "
+                 "multiplier of the main loss score. For example:"
+                 "\n\t 1 - The eyes will receive the same priority as the rest of the face. "
+                 "\n\t 10 - The eyes will be given a score 10 times higher than the rest of the "
+                 "face."
+                 "\n\nNB: Penalized Mask Loss must be enable to use this option.")
+        self.add_item(
+            section=section,
+            title="mouth_multiplier",
+            datatype=int,
+            group="loss",
+            min_max=(1, 40),
+            rounding=1,
+            default=2,
+            fixed=False,
+            info="The amount of priority to give to the mouth.\n\nThe value given here is as a "
+                 "multiplier of the main loss score. For Example:"
+                 "\n\t 1 - The mouth will receive the same priority as the rest of the face. "
+                 "\n\t 10 - The mouth will be given a score 10 times higher than the rest of the "
+                 "face."
+                 "\n\nNB: Penalized Mask Loss must be enable to use this option.")
+        self.add_item(
+            section=section,
             title="penalized_mask_loss",
             datatype=bool,
             default=True,
@@ -337,18 +373,3 @@ class Config(FaceswapConfig):
             info="Dedicate a portion of the model to learning how to duplicate the input "
                  "mask. Increases VRAM usage in exchange for learning a quick ability to try "
                  "to replicate more complex mask models.")
-
-    def load_module(self, filename, module_path, plugin_type):
-        """ Load the defaults module and add defaults """
-        logger.debug("Adding defaults: (filename: %s, module_path: %s, plugin_type: %s",
-                     filename, module_path, plugin_type)
-        module = os.path.splitext(filename)[0]
-        section = ".".join((plugin_type, module.replace("_defaults", "")))
-        logger.debug("Importing defaults module: %s.%s", module_path, module)
-        mod = import_module("{}.{}".format(module_path, module))
-        helptext = mod._HELPTEXT  # pylint:disable=protected-access
-        helptext += ADDITIONAL_INFO if module_path.endswith("model") else ""
-        self.add_section(title=section, info=helptext)
-        for key, val in mod._DEFAULTS.items():  # pylint:disable=protected-access
-            self.add_item(section=section, title=key, **val)
-        logger.debug("Added defaults: %s", section)

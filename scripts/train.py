@@ -10,7 +10,6 @@ from time import sleep
 
 import cv2
 
-from lib.image import read_image
 from lib.keypress import KBHit
 from lib.multithreading import MultiThread
 from lib.utils import (get_folder, get_image_paths, FaceswapError, _image_extensions)
@@ -37,8 +36,12 @@ class Train():  # pylint:disable=too-few-public-methods
     def __init__(self, arguments):
         logger.debug("Initializing %s: (args: %s", self.__class__.__name__, arguments)
         self._args = arguments
-        self._timelapse = self._set_timelapse()
+        if self._args.summary:
+            # If just outputting summary we don't need to initialize everything
+            return
+
         self._images = self._get_images()
+        self._timelapse = self._set_timelapse()
         self._gui_preview_trigger = os.path.join(os.path.realpath(os.path.dirname(sys.argv[0])),
                                                  "lib", "gui", ".cache", ".preview_trigger")
         self._stop = False
@@ -47,52 +50,7 @@ class Train():  # pylint:disable=too-few-public-methods
         self._preview_buffer = dict()
         self._lock = Lock()
 
-        self.trainer_name = self._args.trainer
         logger.debug("Initialized %s", self.__class__.__name__)
-
-    @property
-    def _image_size(self):
-        """ int: The training image size. Reads the first image in the training folder and returns
-        the size. """
-        image = read_image(self._images["a"][0], raise_error=True)
-        size = image.shape[0]
-        logger.debug("Training image size: %s", size)
-        return size
-
-    def _set_timelapse(self):
-        """ Set time-lapse paths if requested.
-
-        Returns
-        -------
-        dict
-            The time-lapse keyword arguments for passing to the trainer
-
-        """
-        if (not self._args.timelapse_input_a and
-                not self._args.timelapse_input_b and
-                not self._args.timelapse_output):
-            return None
-        if (not self._args.timelapse_input_a or
-                not self._args.timelapse_input_b or
-                not self._args.timelapse_output):
-            raise FaceswapError("To enable the timelapse, you have to supply all the parameters "
-                                "(--timelapse-input-A, --timelapse-input-B and "
-                                "--timelapse-output).")
-
-        timelapse_output = str(get_folder(self._args.timelapse_output))
-
-        for folder in (self._args.timelapse_input_a, self._args.timelapse_input_b):
-            if folder is not None and not os.path.isdir(folder):
-                raise FaceswapError("The Timelapse path '{}' does not exist".format(folder))
-            exts = [os.path.splitext(fname)[-1] for fname in os.listdir(folder)]
-            if not any(ext in _image_extensions for ext in exts):
-                raise FaceswapError("The Timelapse path '{}' does not contain any valid "
-                                    "images".format(folder))
-        kwargs = {"input_a": self._args.timelapse_input_a,
-                  "input_b": self._args.timelapse_input_b,
-                  "output": timelapse_output}
-        logger.debug("Timelapse enabled: %s", kwargs)
-        return kwargs
 
     def _get_images(self):
         """ Check the image folders exist and contains images and obtain image paths.
@@ -152,11 +110,64 @@ class Train():  # pylint:disable=too-few-public-methods
                            "Results are likely to be poor.")
             logger.warning(msg)
 
+    def _set_timelapse(self):
+        """ Set time-lapse paths if requested.
+
+        Returns
+        -------
+        dict
+            The time-lapse keyword arguments for passing to the trainer
+
+        """
+        if (not self._args.timelapse_input_a and
+                not self._args.timelapse_input_b and
+                not self._args.timelapse_output):
+            return None
+        if (not self._args.timelapse_input_a or
+                not self._args.timelapse_input_b or
+                not self._args.timelapse_output):
+            raise FaceswapError("To enable the timelapse, you have to supply all the parameters "
+                                "(--timelapse-input-A, --timelapse-input-B and "
+                                "--timelapse-output).")
+
+        timelapse_output = str(get_folder(self._args.timelapse_output))
+
+        for side in ("a", "b"):
+            folder = getattr(self._args, "timelapse_input_{}".format(side))
+            if folder is not None and not os.path.isdir(folder):
+                raise FaceswapError("The Timelapse path '{}' does not exist".format(folder))
+
+            training_folder = getattr(self._args, "input_{}".format(side))
+            if folder == training_folder:
+                continue  # Time-lapse folder is training folder
+
+            filenames = [fname for fname in os.listdir(folder)
+                         if os.path.splitext(fname)[-1].lower() in _image_extensions]
+            if not filenames:
+                raise FaceswapError("The Timelapse path '{}' does not contain any valid "
+                                    "images".format(folder))
+
+            # Time-lapse images must appear in the training set, as we need access to alignment and
+            # mask info. Check filenames are there to save failing much later in the process.
+            training_images = [os.path.basename(img) for img in self._images[side]]
+            if not all(img in training_images for img in filenames):
+                raise FaceswapError("All images in the Timelapse folder '{}' must exist in the "
+                                    "training folder '{}'".format(folder, training_folder))
+
+        kwargs = {"input_a": self._args.timelapse_input_a,
+                  "input_b": self._args.timelapse_input_b,
+                  "output": timelapse_output}
+        logger.debug("Timelapse enabled: %s", kwargs)
+        return kwargs
+
     def process(self):
         """ The entry point for triggering the Training Process.
 
         Should only be called from  :class:`lib.cli.launcher.ScriptExecutor`
         """
+        if self._args.summary:
+            self._load_model()
+            return
         logger.debug("Starting Training Process")
         logger.info("Training data directory: %s", self._args.model_dir)
         thread = self._start_thread()
@@ -236,10 +247,9 @@ class Train():  # pylint:disable=too-few-public-methods
         """
         logger.debug("Loading Model")
         model_dir = str(get_folder(self._args.model_dir))
-        model = PluginLoader.get_model(self.trainer_name)(
+        model = PluginLoader.get_model(self._args.trainer)(
             model_dir,
             self._args,
-            training_image_size=self._image_size,
             predict=False)
         model.build()
         logger.debug("Loaded Model")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ The Faces Viewer Frame and Canvas for Faceswap's Manual Tool. """
 import colorsys
+import gettext
 import logging
 import platform
 import tkinter as tk
@@ -18,6 +19,10 @@ from .viewport import Viewport
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
+# LOCALES
+_LANG = gettext.translation("tools.manual", localedir="locales", fallback=True)
+_ = _LANG.gettext
+
 
 class FacesFrame(ttk.Frame):  # pylint:disable=too-many-ancestors
     """ The faces display frame (bottom section of GUI). This frame holds the faces viewport and
@@ -25,12 +30,12 @@ class FacesFrame(ttk.Frame):  # pylint:disable=too-many-ancestors
 
     Parameters
     ----------
-    parent: :class:`tkinter.PanedWindow`
+    parent: :class:`ttk.PanedWindow`
         The paned window that the faces frame resides in
     tk_globals: :class:`~tools.manual.manual.TkGlobals`
         The tkinter variables that apply to the whole of the GUI
     detected_faces: :class:`~tools.manual.detected_faces.DetectedFaces`
-        The :class:`~lib.faces_detect.DetectedFace` objects for this video
+        The :class:`~lib.align.DetectedFace` objects for this video
     display_frame: :class:`~tools.manual.frameviewer.frame.DisplayFrame`
         The section of the Manual Tool that holds the frames viewer
     """
@@ -155,8 +160,8 @@ class FacesActionsFrame(ttk.Frame):  # pylint:disable=too-many-ancestors
     def _helptext(self):
         """ dict: `button key`: `button helptext`. The help text to display for each button. """
         inverse_keybindings = {val: key for key, val in self.key_bindings.items()}
-        retval = dict(mesh="Display the landmarks mesh",
-                      mask="Display the mask")
+        retval = dict(mesh=_("Display the landmarks mesh"),
+                      mask=_("Display the mask"))
         for item in retval:
             retval[item] += " ({})".format(inverse_keybindings[item])
         return retval
@@ -228,7 +233,7 @@ class FacesViewer(tk.Canvas):   # pylint:disable=too-many-ancestors
         The :class:`tkinter.BooleanVar` objects for selectable optional annotations
         as set by the buttons in the :class:`FacesActionsFrame`
     detected_faces: :class:`~tools.manual.detected_faces.DetectedFaces`
-        The :class:`~lib.faces_detect.DetectedFace` objects for this video
+        The :class:`~lib.align.DetectedFace` objects for this video
     display_frame: :class:`~tools.manual.frameviewer.frame.DisplayFrame`
         The section of the Manual Tool that holds the frames viewer
     event: :class:`threading.Event`
@@ -338,7 +343,7 @@ class FacesViewer(tk.Canvas):   # pylint:disable=too-many-ancestors
             self.yview_moveto(move_to)
         if size_change:
             self._view.reset()
-        self._view.update()
+        self._view.update(refresh_annotations=retain_position)
         if not size_change:
             trigger_var.set(False)
 
@@ -467,7 +472,7 @@ class Grid():
     canvas: :class:`tkinter.Canvas`
         The :class:`~tools.manual.faceviewer.frame.FacesViewer` canvas
     detected_faces: :class:`~tools.manual.detected_faces.DetectedFaces`
-        The :class:`~lib.faces_detect.DetectedFace` objects for this video
+        The :class:`~lib.align.DetectedFace` objects for this video
     """
     def __init__(self, canvas, detected_faces):
         logger.debug("Initializing %s: (detected_faces: %s)",
@@ -652,7 +657,7 @@ class Grid():
         -------
         :class:`numpy.ndarray`
             Array of dimensions (rows, columns) corresponding to the display grid, containing the
-            corresponding :class:`lib.faces_detect.DetectFace` object
+            corresponding :class:`lib.align.DetectFace` object
 
             Any remaining placeholders at the end of the grid which are not populated with a face
             are replaced with ``None``

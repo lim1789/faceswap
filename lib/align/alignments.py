@@ -12,7 +12,15 @@ from lib.serializer import get_serializer, get_serializer_from_filename
 from lib.utils import FaceswapError
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+_VERSION = 2.1
 
+
+# VERSION TRACKING
+# 1.0 - Never really existed. Basically any alignments file prior to version 2.0
+# 2.0 - Implementation of full head extract. Any alignments version below this will have used
+#       legacy extract
+# 2.1 - Alignments data to extracted face PNG header. SHA1 hashes of faces no longer calculated
+#       or stored in alignments file
 
 class Alignments():
     """ The alignments file is a custom serialized ``.fsa`` file that holds information for each
@@ -36,11 +44,14 @@ class Alignments():
     def __init__(self, folder, filename="alignments"):
         logger.debug("Initializing %s: (folder: '%s', filename: '%s')",
                      self.__class__.__name__, folder, filename)
+        self._version = _VERSION
         self._serializer = get_serializer("compressed")
         self._file = self._get_location(folder, filename)
+        self._meta = None
         self._data = self._load()
         self._update_legacy()
         self._hashes_to_frame = dict()
+        self._hashes_to_alignment = dict()
         self._thumbnails = Thumbnails(self)
         logger.debug("Initialized %s", self.__class__.__name__)
 
@@ -87,6 +98,9 @@ class Alignments():
 
         Notes
         -----
+        This method is depractated and exists purely for updating legacy hash based alignments
+        to new png header storage in :class:`lib.align.update_legacy_png_header`.
+
         The first time this property is referenced, the dictionary will be created and cached.
         Subsequent references will be made to this cached dictionary.
         """
@@ -96,6 +110,26 @@ class Alignments():
                 for idx, face in enumerate(val["faces"]):
                     self._hashes_to_frame.setdefault(face["hash"], dict())[frame_name] = idx
         return self._hashes_to_frame
+
+    @property
+    def hashes_to_alignment(self):
+        """ dict: The SHA1 hash of the face mapped to the alignment for the face that the hash
+        corresponds to. The structure of the dictionary is:
+
+        Notes
+        -----
+        This method is depractated and exists purely for updating legacy hash based alignments
+        to new png header storage in :class:`lib.align.update_legacy_png_header`.
+
+        The first time this property is referenced, the dictionary will be created and cached.
+        Subsequent references will be made to this cached dictionary.
+        """
+        if not self._hashes_to_alignment:
+            logger.debug("Generating hashes to alignment")
+            self._hashes_to_alignment = {face["hash"]: face
+                                         for val in self._data.values()
+                                         for face in val["faces"]}
+        return self._hashes_to_alignment
 
     @property
     def mask_summary(self):
@@ -129,9 +163,14 @@ class Alignments():
 
     @property
     def thumbnails(self):
-        """ :class:`~lib.alignments.Thumbnails`: The low resolution thumbnail images that exist
+        """ :class:`~lib.align.Thumbnails`: The low resolution thumbnail images that exist
         within the alignments file """
         return self._thumbnails
+
+    @property
+    def version(self):
+        """ float: The alignments file version number. """
+        return self._version
 
     # << INIT FUNCTIONS >> #
 
@@ -179,6 +218,9 @@ class Alignments():
     def _load(self):
         """ Load the alignments data from the serialized alignments :attr:`file`.
 
+        Populates :attr:`_meta` with the alignment file's meta information as well as returning
+        the serialized data.
+
         Returns
         -------
         dict:
@@ -191,15 +233,20 @@ class Alignments():
 
         logger.info("Reading alignments from: '%s'", self._file)
         data = self._serializer.load(self._file)
+        self._meta = data.get("__meta__", dict(version=1.0))
+        self._version = self._meta["version"]
+        data = data.get("__data__", data)
         logger.debug("Loaded alignments")
         return data
 
     def save(self):
-        """ Write the contents of :attr:`data` to a serialized ``.fsa`` file at the location
-        :attr:`file`. """
+        """ Write the contents of :attr:`data` and :attr:`_meta` to a serialized ``.fsa`` file at
+        the location :attr:`file`. """
         logger.debug("Saving alignments")
         logger.info("Writing alignments to: '%s'", self._file)
-        self._serializer.save(self._file, self._data)
+        data = dict(__meta__=dict(version=self._version),
+                    __data__=self._data)
+        self._serializer.save(self._file, data)
         logger.debug("Saved alignments")
 
     def backup(self):
@@ -499,29 +546,33 @@ class Alignments():
         logger.debug("Updating face %s for frame_name '%s'", face_index, frame_name)
         self._data[frame_name]["faces"][face_index] = face
 
-    def filter_hashes(self, hash_list, filter_out=False):
-        """ Remove faces from :attr:`data` based on a given hash list.
+    def filter_faces(self, filter_dict, filter_out=False):
+        """ Remove faces from :attr:`data` based on a given filter list.
 
         Parameters
         ----------
-        hash_list: list
-            List of SHA1 hashes in `str` format to use as a filter against :attr:`data`
+        filter_dict: dict
+            Dictionary of source filenames as key with a list of face indices to filter as value.
         filter_out: bool, optional
             ``True`` if faces should be removed from :attr:`data` when there is a corresponding
-            match in the given hash_list. ``False`` if faces should be kept in :attr:`data` when
-            there is a corresponding match in the given hash_list, but removed if there is no
+            match in the given filter_dict. ``False`` if faces should be kept in :attr:`data` when
+            there is a corresponding match in the given filter_dict, but removed if there is no
             match. Default: ``False``
         """
-        hashset = set(hash_list)
-        for filename, val in self._data.items():
-            for idx, face in reversed(list(enumerate(val["faces"]))):
-                if ((filter_out and face.get("hash", None) in hashset) or
-                        (not filter_out and face.get("hash", None) not in hashset)):
-                    logger.verbose("Filtering out face: (filename: %s, index: %s)", filename, idx)
-                    del val["faces"][idx]
-                else:
-                    logger.trace("Not filtering out face: (filename: %s, index: %s)",
-                                 filename, idx)
+        logger.debug("filter_dict: %s, filter_out: %s", filter_dict, filter_out)
+        for source_frame, frame_data in self._data.items():
+            face_indices = filter_dict.get(source_frame, [])
+            if filter_out:
+                filter_list = face_indices
+            else:
+                filter_list = [idx for idx in range(len(frame_data["faces"]))
+                               if idx not in face_indices]
+            logger.trace("frame: '%s', filter_list: %s", source_frame, filter_list)
+
+            for face_idx in reversed(sorted(filter_list)):
+                logger.verbose("Filtering out face: (filename: %s, index: %s)",
+                               source_frame, face_idx)
+                del frame_data["faces"][face_idx]
 
     # << GENERATORS >> #
     def yield_faces(self):
@@ -709,7 +760,7 @@ class Thumbnails():
 
     Parameters
     ----------
-    alignments: :class:'~lib.alignments.Alignments`
+    alignments: :class:'~lib.align.Alignments`
         The parent alignments class that these thumbs belong to
     """
     def __init__(self, alignments):
